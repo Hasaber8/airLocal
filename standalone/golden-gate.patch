@@ -1,0 +1,367 @@
+diff --git a/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.h b/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.h
+index 66005bc..8dc7e4e 100644
+--- a/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.h
++++ b/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.h
+@@ -30,6 +30,7 @@ typedef struct {
+     GG_Event    base;
+     const char* peripheral_name;
+     const char* peripheral_id;
++    const char* device_marker;
+     int         rssi;
+ } GG_StackToolBluetoothTransportScanEvent;
+ 
+@@ -47,6 +48,7 @@ typedef struct {
+ //----------------------------------------------------------------------
+ #define GG_EVENT_TYPE_BLUETOOTH_TRANSPORT_SCAN                      GG_4CC('s', 'c', 'a', 'n')
+ #define GG_EVENT_TYPE_BLUETOOTH_LINK_CONNECTED_EVENT                GG_4CC('l', 'i', 'n', 'k')
++#define GG_EVENT_TYPE_BLUETOOTH_LINK_SECURED_EVENT                  GG_4CC('s', 'e', 'c', 'u')
+ #define GG_EVENT_TYPE_BLUETOOTH_LINK_STATUS_CONENCTION_CONFIG_EVENT GG_4CC('l', 's', 'c', 'c')
+ 
+ //----------------------------------------------------------------------
+@@ -57,6 +59,8 @@ GG_Result GG_StackToolBluetoothTransport_Create(GG_Loop*
+                                                 const char*                      device_id,
+                                                 GG_StackToolBluetoothTransport** transport);
+ void GG_StackToolBluetoothTransport_Destroy(GG_StackToolBluetoothTransport* self);
+ void GG_StackToolBluetoothTransport_Start(GG_StackToolBluetoothTransport* self);
++const char* GG_StackToolBluetoothTransport_GetPeerId(GG_StackToolBluetoothTransport* self);
++void GG_StackToolBluetoothTransport_RequestBond(GG_StackToolBluetoothTransport* self);
+ void GG_StackToolBluetoothTransport_Connect(GG_StackToolBluetoothTransport* self, const char* device_id);
+ void GG_StackToolBluetoothTransport_SetPreferredConnectionMode(GG_StackToolBluetoothTransport* self, uint8_t mode);
+ GG_DataSource* GG_StackToolBluetoothTransport_AsDataSource(GG_StackToolBluetoothTransport* self);
+diff --git a/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.m b/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.m
+index b5679f7..72c2cd6 100644
+--- a/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.m
++++ b/xp/apps/stack-tool/gg_stack_tool_core_bluetooth_transport.m
+@@ -106,13 +106,15 @@
+ //----------------------------------------------------------------------
+ static void GG_StackToolBluetoothTransport_UpdateMtu(GG_StackToolBluetoothTransport* self, size_t mtu);
+ static void GG_StackToolBluetoothTransport_NotifyConnected(GG_StackToolBluetoothTransport* self);
++static void GG_StackToolBluetoothTransport_NotifySecured(GG_StackToolBluetoothTransport* self);
+ static void GG_StackToolBluetoothTransport_OnDataReceived(GG_StackToolBluetoothTransport* self,
+                                                           const void*                     data,
+                                                           size_t                          data_size);
+ static void GG_StackToolBluetoothTransport_OnDeviceDiscovered(GG_StackToolBluetoothTransport* self,
+-                                                              const char*                     peripheral_name,
+-                                                              const char*                     peripheral_id,
+-                                                              int                             rssi);
++                                                               const char*                     peripheral_name,
++                                                               const char*                     peripheral_id,
++                                                               const char*                     device_marker,
++                                                               int                             rssi);
+ static void GG_StackToolBluetoothTransport_OnLinkStatusConfigurationUpdated(GG_StackToolBluetoothTransport* self,
+                                                                             unsigned int connection_interval,
+                                                                             unsigned int slave_latency,
+@@ -129,6 +131,16 @@ @interface HubBluetoothTransport: NSObject <CBCentralManagerDelegate,
+ 
+ @property (strong, nonatomic) NSLock*                  lock;
+ @property (strong, nonatomic) NSUUID*                  target;
++@property (strong, nonatomic) NSString*                targetName;
++@property (strong, nonatomic) NSString*                targetMarker;
++@property (nonatomic)         BOOL                     requireBond;
++@property (nonatomic)         BOOL                     secureReadCompleted;
++@property (nonatomic)         BOOL                     linkEncrypted;
++@property (nonatomic)         BOOL                     readyNotified;
++@property (nonatomic)         BOOL                     secureNotified;
++@property (strong, nonatomic) CBCharacteristic*        secureCharacteristic;
++@property (strong, nonatomic) CBCharacteristic*        linkStatusCharacteristic;
++@property (strong, nonatomic) dispatch_queue_t         btQueue;
+ @property (strong, nonatomic) CBCentralManager*        centralManager;
+ @property (strong, nonatomic) CBPeripheralManager*     peripheralManager;
+ @property (strong, nonatomic) CBPeripheral*            peripheral;
+@@ -173,7 +185,16 @@ - (id) initWithHost: (GG_StackToolBluetoothTransport *)host target: (NSString *)
+         self.host = host;
+ 
+         // convert the target to a CBUUID
+-        if (![target isEqualToString: @"scan"]) {
++        if ([target hasPrefix: @"name:"]) {
++            self.targetName = [target substringFromIndex: 5];
++        } else if ([target hasPrefix: @"marker:"]) {
++            self.targetMarker = [[target substringFromIndex: 7] lowercaseString];
++        } else if ([target hasPrefix: @"bond:"]) {
++            self.targetMarker = [[target substringFromIndex: 5] lowercaseString];
++        } else if ([target hasPrefix: @"paired:"]) {
++            self.target = [[NSUUID alloc] initWithUUIDString: [target substringFromIndex: 7]];
++            self.requireBond = YES;
++        } else if (![target isEqualToString: @"scan"]) {
+             self.target = [[NSUUID alloc] initWithUUIDString: target];
+         }
+ 
+@@ -214,7 +235,8 @@ - (id) initWithHost: (GG_StackToolBluetoothTransport *)host target: (NSString *)
+ // Start the transport
+ - (void)start {
+     // get a queue to do the central and peripheral work on
+-    dispatch_queue_t bt_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
++    self.btQueue = dispatch_queue_create("local.fitbit-air.reader.bluetooth", DISPATCH_QUEUE_SERIAL);
++    dispatch_queue_t bt_queue = self.btQueue;
+ 
+     // initialize the peripheral manager
+     // NOTE: allocate first, then init, because init may invoke a delegate before returning,
+@@ -237,16 +259,48 @@ - (bool)findTarget {
+             [CBUUID UUIDWithString: GG_LINK_STATUS_SERVICE_UUID]
+         ]];
+     for (CBPeripheral* peripheral in connected) {
+-        if (self.target && [peripheral.identifier.UUIDString isEqualTo: self.target.UUIDString]) {
++        if ((self.target && [peripheral.identifier.UUIDString isEqualTo: self.target.UUIDString]) ||
++            (self.targetName && [peripheral.name isEqualToString: self.targetName])) {
++            self.target = peripheral.identifier;
++            fprintf(stderr, "Found connected %s: %s\n", peripheral.name.UTF8String,
++                    self.target.UUIDString.UTF8String);
+             GG_LOG_INFO("found target, already connected");
+             [self onTargetFound: peripheral];
+             return true;
+         }
+     }
+ 
++    if (self.target) {
++        NSArray<CBPeripheral *>* known = [self.centralManager retrievePeripheralsWithIdentifiers: @[self.target]];
++        if (known.count) {
++            [self onTargetFound: known.firstObject];
++            return true;
++        }
++    }
++
+     return false;
+ }
+ 
++- (void)notifyIfReady {
++    if (!self.readyNotified && self.gattlinkRxOk && self.gattlinkTxOk &&
++        (!self.requireBond || (self.secureReadCompleted && self.linkEncrypted))) {
++        self.readyNotified = YES;
++        GG_StackToolBluetoothTransport_NotifyConnected(self.host);
++    }
++    if (self.requireBond && !self.secureNotified && self.secureReadCompleted && self.linkEncrypted) {
++        self.secureNotified = YES;
++        GG_StackToolBluetoothTransport_NotifySecured(self.host);
++    }
++}
++
++- (void)requestBond {
++    self.requireBond = YES;
++    if (self.secureCharacteristic) {
++        fprintf(stderr, "Requesting an encrypted BLE link. Confirm macOS Bluetooth pairing if prompted.\n");
++        [self.peripheral readValueForCharacteristic: self.secureCharacteristic];
++    }
++}
++
+ // Connect to a peripheral when found
+ - (void)onTargetFound: (CBPeripheral*) peripheral {
+     GG_LOG_INFO("target found");
+@@ -269,10 +323,7 @@ - (void)startScanning {
+                 [CBUUID UUIDWithString: GG_LINK_STATUS_SERVICE_UUID]
+             ]
+                                                     options: @{
+-                CBCentralManagerScanOptionAllowDuplicatesKey: @YES,
+-                CBCentralManagerScanOptionSolicitedServiceUUIDsKey: @[
+-                    [CBUUID UUIDWithString: GG_GATTLINK_SERVICE_UUID]
+-                ]
++                CBCentralManagerScanOptionAllowDuplicatesKey: @NO
+             }
+         ];
+         GG_LOG_INFO("scanning started");
+@@ -357,7 +408,16 @@ - (void)centralManager: (CBCentralManager *)central
+      advertisementData: (NSDictionary *)advertisementData
+                   RSSI: (NSNumber *)RSSI {
+     GG_COMPILER_UNUSED(central);
+-    GG_COMPILER_UNUSED(advertisementData);
++
++    NSString* name = advertisementData[CBAdvertisementDataLocalNameKey];
++    if (name == nil) name = peripheral.name;
++    NSData* deviceInfo = advertisementData[CBAdvertisementDataServiceDataKey][[CBUUID UUIDWithString: @"180A"]];
++    NSMutableString* marker = nil;
++    if (deviceInfo.length == 8) {
++        marker = [NSMutableString stringWithCapacity: 16];
++        const uint8_t* bytes = deviceInfo.bytes;
++        for (NSUInteger i = 0; i < deviceInfo.length; ++i) [marker appendFormat: @"%02x", bytes[i]];
++    }
+ 
+     if (self.peripheral) {
+         // we already have a peripheral, just ignore this
+@@ -366,19 +426,29 @@ - (void)centralManager: (CBCentralManager *)central
+     }
+ 
+     // if we're just scanning, notify the listener
+-    if (self.target == nil) {
++    if (self.target == nil && self.targetName == nil && self.targetMarker == nil) {
+         GG_StackToolBluetoothTransport_OnDeviceDiscovered(self.host,
+-                                                          peripheral.name.UTF8String,
++                                                          name.UTF8String,
+                                                           peripheral.identifier.UUIDString.UTF8String,
++                                                          marker.UTF8String,
+                                                           RSSI.intValue);
+     }
+ 
+     // check if this is our target
+     GG_LOG_INFO("found peripheral %s, rssi=%d, state=%d, id=%s",
+-                peripheral.name.UTF8String,
++                name.UTF8String,
+                 RSSI.intValue,
+                 (int)peripheral.state,
+                 peripheral.identifier.UUIDString.UTF8String);
++    if (self.targetName && [name isEqualToString: self.targetName]) {
++        self.target = peripheral.identifier;
++        fprintf(stderr, "Found %s: %s\n", self.targetName.UTF8String,
++                self.target.UUIDString.UTF8String);
++    }
++    if (self.targetMarker && [marker isEqualToString: self.targetMarker]) {
++        self.target = peripheral.identifier;
++        fprintf(stderr, "Matched current advertisement marker %s: %s\n", marker.UTF8String, self.target.UUIDString.UTF8String);
++    }
+     if (self.target && [peripheral.identifier.UUIDString isEqualTo: self.target.UUIDString]) {
+         [self onTargetFound: peripheral];
+     }
+@@ -433,6 +503,12 @@ -  (void)centralManager: (CBCentralManager *)central
+     self.gattConfirmationServiceEphemeralCharacteristicUuid = nil;
+     self.gattlinkTxOk = false;
+     self.gattlinkRxOk = false;
++    self.readyNotified = false;
++    self.secureReadCompleted = false;
++    self.linkEncrypted = false;
++    self.secureNotified = false;
++    self.secureCharacteristic = nil;
++    self.linkStatusCharacteristic = nil;
+     self.peripheral = nil;
+ 
+     [self startScanning];
+@@ -474,7 +550,8 @@ - (void)peripheral: (CBPeripheral *)peripheral didDiscoverServices: (NSError *)e
+             GG_LOG_FINE("Link Status Service discovered");
+             [peripheral discoverCharacteristics: @[
+                     [CBUUID UUIDWithString: GG_LINK_STATUS_CONNECTION_CONFIGURATION_CHARACTERISTIC_UUID],
+-                    [CBUUID UUIDWithString: GG_LINK_STATUS_CONNECTION_STATUS_CHARACTERISTIC_UUID]
++                     [CBUUID UUIDWithString: GG_LINK_STATUS_CONNECTION_STATUS_CHARACTERISTIC_UUID],
++                     [CBUUID UUIDWithString: GG_LINK_STATUS_SECURE_CHARACTERISTIC_UUID]
+                 ] forService: service];
+         } else if ([service.UUID isEqual: [CBUUID UUIDWithString: GG_GATT_CONFIRMATION_SERVICE_UUID]]) {
+             // GATT Confirmation Service
+@@ -532,15 +609,14 @@ -                   (void)peripheral: (CBPeripheral *)peripheral
+             [peripheral setNotifyValue: YES forCharacteristic: characteristic];
+         } else if ([characteristic.UUID isEqual:
+                        [CBUUID UUIDWithString: GG_LINK_STATUS_CONNECTION_STATUS_CHARACTERISTIC_UUID]]) {
++            self.linkStatusCharacteristic = characteristic;
+             GG_LOG_FINE("subscribing to the Link Status Connection Status Characteristic");
+             [peripheral setNotifyValue: YES forCharacteristic: characteristic];
+         } else if ([characteristic.UUID isEqual: [CBUUID UUIDWithString: GG_GATTLINK_RX_CHARACTERISTIC_UUID]]) {
+             GG_LOG_FINE("found Gattlink RX");
+             if (!self.gattlinkRxOk) {
+                 self.gattlinkRxOk = true;
+-                if (self.gattlinkTxOk) {
+-                    GG_StackToolBluetoothTransport_NotifyConnected(self.host);
+-                }
++                [self notifyIfReady];
+             }
+             self.gattlinkRxCharacteristic = characteristic;
+ 
+@@ -554,6 +630,10 @@ -                   (void)peripheral: (CBPeripheral *)peripheral
+         } else if ([characteristic.UUID isEqual: [CBUUID UUIDWithString: GG_GATTLINK_TX_CHARACTERISTIC_UUID]]) {
+             GG_LOG_FINE("found Gattlink TX");
+             [peripheral setNotifyValue: YES forCharacteristic: characteristic];
++        } else if ([characteristic.UUID isEqual:
++                       [CBUUID UUIDWithString: GG_LINK_STATUS_SECURE_CHARACTERISTIC_UUID]]) {
++            self.secureCharacteristic = characteristic;
++            if (self.requireBond) [self requestBond];
+         } else if ([characteristic.UUID isEqual:
+             [CBUUID UUIDWithString: GG_GATT_CONFIRMATION_EPHEMERAL_CHARACTERISTIC_POINTER_UUID]]) {
+             GG_LOG_FINE("found ephermeral characteristic pointer characteristic");
+@@ -587,9 +667,7 @@ -                          (void)peripheral:(CBPeripheral *)peripheral
+         GG_LOG_FINE("subscribed to Gattlink TX");
+         if (!self.gattlinkTxOk) {
+             self.gattlinkTxOk = true;
+-            if (self.gattlinkRxOk) {
+-                GG_StackToolBluetoothTransport_NotifyConnected(self.host);
+-            }
++            [self notifyIfReady];
+         }
+     } else if ([characteristic.UUID isEqual:
+                [CBUUID UUIDWithString: GG_LINK_STATUS_CONNECTION_CONFIGURATION_CHARACTERISTIC_UUID]]) {
+@@ -662,11 +740,21 @@ -              (void)peripheral: (CBPeripheral *)peripheral
+     GG_COMPILER_UNUSED(error);
+ 
+     if (error) {
++        if (self.requireBond && [characteristic.UUID isEqual:
++                [CBUUID UUIDWithString: GG_LINK_STATUS_SECURE_CHARACTERISTIC_UUID]]) {
++            fprintf(stderr, "Secure BLE read failed (%s, code %ld): %s\n", error.domain.UTF8String,
++                    (long)error.code, error.localizedDescription.UTF8String);
++        }
+         GG_LOG_WARNING("characteristic value update error: %s", error.localizedDescription.UTF8String);
+         return;
+     }
+ 
+-    if ([characteristic.UUID isEqual: [CBUUID UUIDWithString: GG_GATTLINK_TX_CHARACTERISTIC_UUID]]) {
++    if (self.requireBond && [characteristic.UUID isEqual: [CBUUID UUIDWithString: GG_LINK_STATUS_SECURE_CHARACTERISTIC_UUID]]) {
++        self.secureReadCompleted = YES;
++        fprintf(stderr, "Secure BLE characteristic read succeeded.\n");
++        if (self.linkStatusCharacteristic) [peripheral readValueForCharacteristic: self.linkStatusCharacteristic];
++        [self notifyIfReady];
++    } else if ([characteristic.UUID isEqual: [CBUUID UUIDWithString: GG_GATTLINK_TX_CHARACTERISTIC_UUID]]) {
+         GG_LOG_FINER("<<< gattlink TX, size=%u", (int)characteristic.value.length);
+         GG_StackToolBluetoothTransport_OnDataReceived(self.host,
+                                                       characteristic.value.bytes,
+@@ -739,6 +827,9 @@ -              (void)peripheral: (CBPeripheral *)peripheral
+         }
+         const uint8_t* data = characteristic.value.bytes;
+         uint8_t flags = data[0];
++        self.linkEncrypted = (flags & GG_LINK_STATUS_CONNECTION_STATUS_FLAG_ENCRYPTED) != 0;
++        if (self.requireBond && self.linkEncrypted) fprintf(stderr, "BLE link encryption verified.\n");
++        [self notifyIfReady];
+         uint8_t dle_max_tx_pdu_size = data[1];
+         uint16_t dle_max_tx_time = GG_BytesToInt16Le(data + 2);
+         uint8_t dle_max_rx_pdu_size = data[4];
+@@ -1587,6 +1678,19 @@ - (void)cleanupPeripheral {
+     }
+ }
+ 
++const char*
++GG_StackToolBluetoothTransport_GetPeerId(GG_StackToolBluetoothTransport* self)
++{
++    return self->hub_driver.peripheral.identifier.UUIDString.UTF8String;
++}
++
++void
++GG_StackToolBluetoothTransport_RequestBond(GG_StackToolBluetoothTransport* self)
++{
++    HubBluetoothTransport* driver = self->hub_driver;
++    dispatch_async(driver.btQueue, ^{ [driver requestBond]; });
++}
++
+ //----------------------------------------------------------------------
+ void
+ GG_StackToolBluetoothTransport_Connect(GG_StackToolBluetoothTransport* self, const char* device_id)
+@@ -1722,6 +1826,23 @@ - (void)cleanupPeripheral {
+     }
+ }
+ 
++static int
++GG_StackToolBluetoothTransport_NotifySecured_(void* args)
++{
++    GG_StackToolBluetoothTransport* self = (GG_StackToolBluetoothTransport*)args;
++    GG_Event event = {.type = GG_EVENT_TYPE_BLUETOOTH_LINK_SECURED_EVENT};
++    GG_EventListener_OnEvent(self->connection_listener, &event);
++    return 0;
++}
++
++static void
++GG_StackToolBluetoothTransport_NotifySecured(GG_StackToolBluetoothTransport* self)
++{
++    if (self->connection_listener) {
++        GG_Loop_InvokeSync(self->loop, GG_StackToolBluetoothTransport_NotifySecured_, self, NULL);
++    }
++}
++
+ //----------------------------------------------------------------------
+ static void
+ GG_StackToolBluetoothTransport_OnDataReceived(GG_StackToolBluetoothTransport* self,
+@@ -1764,6 +1885,7 @@ - (void)cleanupPeripheral {
+ GG_StackToolBluetoothTransport_OnDeviceDiscovered(GG_StackToolBluetoothTransport* self,
+                                                   const char*                     peripheral_name,
+                                                   const char*                     peripheral_id,
++                                                  const char*                     device_marker,
+                                                   int                             rssi)
+ {
+     // check if we have a listener
+@@ -1779,6 +1901,7 @@ - (void)cleanupPeripheral {
+             },
+             .peripheral_name = peripheral_name,
+             .peripheral_id   = peripheral_id,
++            .device_marker   = device_marker,
+             .rssi            = rssi
+         }
+     };
