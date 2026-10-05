@@ -1,0 +1,35 @@
+name: Checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test BLE decoding and dashboard API
+        run: python -m unittest discover -s dashboard -p 'test_*.py'
+      - name: Check JavaScript syntax
+        run: |
+          node --check dashboard/app.js
+          node --check dashboard/health.js
+          node --check research/capture-megadump.js
+
+  native:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build macOS reader and run protocol checks
+        run: uv run --locked python standalone/build.py
