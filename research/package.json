@@ -1,0 +1,8 @@
+{
+  "name": "airlocal-research",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "frida-java-bridge": "7.0.13"
+  }
+}
