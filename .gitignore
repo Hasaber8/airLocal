@@ -1,0 +1,36 @@
+# Local Python and Node environments.
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Credentials, health records, and raw captures.
+/standalone/private/
+/dashboard/data/
+/captures/*
+!/captures/.gitkeep
+*.btsnoop
+*.mitm
+*.log
+*.partial
+/dashboard/*.png
+/dashboard/tmp*/
+
+# Downloaded dependencies, APKs, and local build tools.
+/golden-gate/
+/apks*/
+/apktool*/
+/root-device/
+/research/local/
+/standalone-build/
+/standalone/build/
+/standalone/android-build/
+/standalone/tools/
+
+# Generated Frida agents are rebuilt from research sources.
+/capture-megadump-agent.js
+/research/capture-megadump-agent.js

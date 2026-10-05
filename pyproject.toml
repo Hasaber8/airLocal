@@ -1,0 +1,10 @@
+[project]
+name = "airlocal"
+version = "0.1.0"
+description = "A local BLE reader and health dashboard for Fitbit Air"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
